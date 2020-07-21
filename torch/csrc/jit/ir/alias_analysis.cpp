@@ -507,9 +507,12 @@ void AliasDb::analyzeImpl(Node* node) {
     case prim::ListUnpack:
     case prim::PythonOp:
     case prim::GetAttr:
-      if (isFrozen_ && node->kind() == prim::GetAttr &&
-          node->input()->type()->expect<ClassType>()->is_module())
-        return analyzeCreator(node);
+      if (isFrozen_ && node->kind() == prim::GetAttr) {
+        auto& ty = node->input()->type();
+        if (ty->cast<InterfaceType>() || ty->expect<ClassType>()->is_module()) {
+          return analyzeCreator(node);
+        }
+      }
       return analyzeExtractor(node);
     case prim::unchecked_cast:
       return makePointerTo(node->output(), node->input());
@@ -841,6 +844,7 @@ void AliasDb::analyzeRpcAsync(Node* node) {
 // SetAttr: writes to the `self` field
 void AliasDb::analyzeSetAttr(Node* node) {
   const auto self = node->inputs().at(0);
+
   TORCH_INTERNAL_ASSERT(self->type()->kind() == TypeKind::ClassType);
   registerWrite(self, node);
   // Also the value being set must become a wildcard.
