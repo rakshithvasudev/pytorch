@@ -398,7 +398,7 @@ ProcessGroupNCCL::ProcessGroupNCCL(
     : ProcessGroup(rank, size),
       store_(store),
       ncclCommCounter_(0),
-      terminateWatchdog_(false),
+      terminateProcessGroup_(false),
       opTimeout_(opTimeout) {
   try {
     parseNcclBlockingWait();
@@ -412,11 +412,14 @@ ProcessGroupNCCL::ProcessGroupNCCL(
   ncclCommWatchdogThread_ =
       std::thread(&ProcessGroupNCCL::ncclCommWatchdog, this);
 #endif
+
+  workCleanupThread_ = std::thread(&ProcessGroupNCCL::workCleanupLoop, this);
 }
 
 ProcessGroupNCCL::~ProcessGroupNCCL() {
-  terminateWatchdog_.store(true);
+  terminateProcessGroup_.store(true);
   watchdogCV_.notify_one();
+  workVectorCV_.notify_one();
 #ifdef ENABLE_NCCL_ERROR_CHECKING
   ncclCommWatchdogThread_.join();
 #endif
@@ -432,6 +435,7 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
       }
     }
   }
+  workCleanupThread_.join();
 }
 
 void ProcessGroupNCCL::ncclCommWatchdog() {
@@ -446,7 +450,7 @@ void ProcessGroupNCCL::ncclCommWatchdog() {
 }
 
 void ProcessGroupNCCL::ncclCommWatchdogInternal() {
-  while (!terminateWatchdog_.load()) {
+  while (!terminateProcessGroup_.load()) {
     std::unordered_set<std::string> abortedCommIds;
     std::unordered_set<std::string> allCommIds;
 
@@ -542,7 +546,32 @@ void ProcessGroupNCCL::ncclCommWatchdogInternal() {
     watchdogCV_.wait_for(
         lock,
         std::chrono::milliseconds(kWatchdogThreadSleepMillis),
-        [&]() -> bool { return terminateWatchdog_.load(); });
+        [&]() -> bool { return terminateProcessGroup_.load(); });
+  }
+}
+
+void ProcessGroupNCCL::workCleanupLoop() {
+  while (!terminateProcessGroup_.load()) {
+    std::unique_lock<std::mutex> lock(workVectorMutex_);
+    // We busy-poll the work vector every kWatchdogThreadSleepMillis
+    // milliseconds as long as the atomic is True.
+    workVectorCV_.wait_for(
+        lock,
+        std::chrono::milliseconds(kWatchdogThreadSleepMillis),
+        [&]() -> bool { return terminateProcessGroup_.load(); });
+
+    for (auto it = workVector_.begin(); it != workVector_.end();
+         /* no increment*/) {
+      auto& work = *it;
+      if (work->isCompleted()) {
+        // Remove all Completed WorkNCCL Objects from the Vector
+        it = workVector_.erase(it);
+      } else {
+        // Increment the iterator if the current WorkNCCL object is not
+        // completed.
+        ++it;
+      }
+    }
   }
 }
 
@@ -778,6 +807,15 @@ c10::intrusive_ptr<c10::ivalue::Future> ProcessGroupNCCL::WorkNCCL::
   return c10::make_intrusive<FutureNCCL>(shared_from_this(), outputs_);
 }
 
+void ProcessGroupNCCL::enqueue(
+    std::shared_ptr<ProcessGroupNCCL::WorkNCCL> work) {
+  {
+    std::lock_guard<std::mutex> lock(workVectorMutex_);
+    workVector_.emplace_back(std::move(work));
+  }
+  workVectorCV_.notify_one();
+}
+
 template <typename Fn, typename PreProcess, typename PostProcess>
 std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::collective(
     std::vector<at::Tensor>& inputs,
@@ -839,6 +877,8 @@ std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::collective(
     work->opTimeout_ = opTimeout_;
     work->store_ = store_;
   }
+
+  enqueue(work);
 
   return work;
 }
