@@ -264,6 +264,7 @@ class ConvRelu(QuantizeHandler):
 @register_quant_pattern(torch.nn.Linear)
 @register_quant_pattern(torch.nn.functional.linear)
 @register_quant_pattern(torch.nn.qat.Linear)
+@register_quant_pattern(torch.nn.intrinsic.LinearReLU)
 @register_quant_pattern(torch.nn.intrinsic.qat.LinearReLU)
 @register_quant_pattern((torch.nn.functional.relu, torch.nn.functional.linear))
 @register_quant_pattern((torch.nn.ReLU, torch.nn.functional.linear))
@@ -565,6 +566,8 @@ class Quantizer:
 
     def convert(self, observed, inplace=False, debug=False):
         assert self.activation_post_process_map is not None
+        # move to cpu since we only have quantized cpu kernels
+        observed.eval().cpu()
         observed_root = observed.root
         observed_graph = observed.graph
         if not inplace:
@@ -676,6 +679,7 @@ class Quantizer:
                     parent_name = ''
 
                     scale, zero_point = observer_module.calculate_qparams()
+                    # TODO: per channel
                     scale = float(scale)
                     zero_point = int(zero_point)
                     dtype = observer_module.dtype
